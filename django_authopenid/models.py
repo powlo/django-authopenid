@@ -1,49 +1,30 @@
 # -*- coding: utf-8 -*-
-# Copyright 2007, 2008,2009 by Benoît Chesneau <benoitc@e-engura.org>
-# 
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
-
-import os
-import random
-import sys
-import time
-try:
-    from hashlib import md5 as _md5
-except ImportError:
-    import md5
-    _md5 = md5.new
-
+import datetime
 
 from django.conf import settings
-from django.template.loader import render_to_string
 from django.contrib.auth.models import User
-from django.contrib.sites.models import Site
 from django.db import models
-from django.utils.translation import ugettext_lazy as _
+from django.utils import timezone
 
-from django_authopenid.signals import oid_associate
+from picklefield.fields import PickledObjectField
 
-__all__ = ['Nonce', 'Association', 'UserAssociation']
+import hashlib, random, sys, os, time
+
+VERIFIER_EXPIRE_DAYS = getattr(settings, 'VERIFIER_EXPIRE_DAYS', 3)
+
+__all__ = ['Nonce', 'Association', 'UserAssociation',
+        'UserPasswordQueueManager', 'UserPasswordQueue',
+        'UserEmailVerifier']
 
 class Nonce(models.Model):
     """ openid nonce """
     server_url = models.CharField(max_length=255)
     timestamp = models.IntegerField()
     salt = models.CharField(max_length=40)
-    
+
     def __unicode__(self):
         return u"Nonce: %s" % self.id
+
 
 class Association(models.Model):
     """ association openid url and lifetime """
@@ -53,40 +34,85 @@ class Association(models.Model):
     issued = models.IntegerField()
     lifetime = models.IntegerField()
     assoc_type = models.TextField(max_length=64)
-    
+
     def __unicode__(self):
         return u"Association: %s, %s" % (self.server_url, self.handle)
 
 class UserAssociation(models.Model):
-    """ 
-    model to manage association between openid and user 
     """
-    openid_url = models.CharField(primary_key=True, blank=False,
-                            max_length=255, verbose_name=_('OpenID URL'))
-    user = models.ForeignKey(User, verbose_name=_('User'))
-    
+    model to manage association between openid and user
+    """
+    #todo: rename this field so that it sounds good for other methods
+    #for exaple, for password provider this will hold password
+    openid_url = models.CharField(blank=False, max_length=255)
+    user = models.ForeignKey(User)
+    #in the future this must be turned into an
+    #association with a Provider record
+    #to hold things like login badge, etc
+    provider_name = models.CharField(max_length=64, default='unknown')
+    last_used_timestamp = models.DateTimeField(null=True)
+
+    class Meta(object):
+        unique_together = (
+                                ('user','provider_name'),
+                                ('openid_url', 'provider_name')
+                            )
+
     def __unicode__(self):
-        return "Openid %s with user %s" % (self.openid_url, self.user)
-        
-    def save(self, send_email=True):
-        super(UserAssociation, self).save()
-        if send_email:
-            from django.core.mail import send_mail
-            current_site = Site.objects.get_current()
-            subject = render_to_string('authopenid/associate_email_subject.txt',
-                                       { 'site': current_site,
-                                         'user': self.user})
-            message = render_to_string('authopenid/associate_email.txt',
-                                       { 'site': current_site,
-                                         'user': self.user,
-                                         'openid': self.openid_url
-                                        })
+        return u"Openid %s with user %s" % (self.openid_url, self.user)
 
-            send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, 
-                    [self.user.email], fail_silently=True)
-        oid_associate.send(sender=self, user=self.user, openid=self.openid_url)
-        
+    def update_timestamp(self):
+        self.last_used_timestamp = datetime.datetime.now()
+        self.save()
 
-    class Meta:
-        verbose_name = _('user association')
-        verbose_name_plural = _('user associations')
+class UserPasswordQueueManager(models.Manager):
+    """ manager for UserPasswordQueue object """
+    def get_new_confirm_key(self):
+        "Returns key that isn't being used."
+        # The random module is seeded when this Apache child is created.
+        # Use SECRET_KEY as added salt.
+        while 1:
+            confirm_key = hashlib.md5("%s%s%s%s" % (
+                random.randint(0, sys.maxint - 1), os.getpid(),
+                time.time(), settings.SECRET_KEY)).hexdigest()
+            try:
+                self.get(confirm_key=confirm_key)
+            except self.model.DoesNotExist:
+                break
+        return confirm_key
+
+
+class UserPasswordQueue(models.Model):
+    """
+    model for new password queue.
+    """
+    user = models.ForeignKey(User, unique=True)
+    new_password = models.CharField(max_length=30)
+    confirm_key = models.CharField(max_length=40)
+
+    objects = UserPasswordQueueManager()
+
+    def __unicode__(self):
+        return self.user.username
+
+class UserEmailVerifier(models.Model):
+    '''Model that stores the required values to verify an email
+    address'''
+    key = models.CharField(max_length=255, unique=True, primary_key=True)
+    value = PickledObjectField()
+    verified = models.BooleanField(default=False)
+    expires_on = models.DateTimeField(blank=True)
+
+    def save(self, *args, **kwargs):
+        if not self.expires_on:
+            self.expires_on = timezone.now() + \
+                    datetime.timedelta(VERIFIER_EXPIRE_DAYS)
+
+        super(UserEmailVerifier, self).save(*args, **kwargs)
+
+    def has_expired(self):
+        now = timezone.now()
+        return now > self.expires_on
+
+    def __unicode__(self):
+        return self.key
